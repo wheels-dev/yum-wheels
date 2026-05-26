@@ -172,7 +172,12 @@ jobs:
           set -euo pipefail
           git config user.name  "wheels-release-bot"
           git config user.email "hello@wheels.dev"
-          git add stable/ bleeding-edge/
+          # Only add channel dirs that exist — first run only has one of them
+          # (whichever channel the dispatch was for). `git add` on a missing
+          # pathspec is fatal even when the other path matches.
+          for d in stable bleeding-edge; do
+            [ -d "$d" ] && git add "$d"
+          done
           if git diff --cached --quiet; then
             echo "No changes — dispatch must have been a no-op."
             exit 0
