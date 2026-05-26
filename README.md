@@ -3,8 +3,11 @@
 Source repository backing **<https://yum.wheels.dev>**, the native Fedora/RHEL
 package repository for the [Wheels](https://wheels.dev) CFML framework CLI.
 
-This repo holds the static yum metadata tree plus the pooled `.rpm` artifacts,
-and is auto-deployed to Cloudflare Pages on every push to `main`. End users do:
+This repo holds the **workflow + scripts + landing page + signing key + .repo files**.
+The yum metadata tree (`<channel>/repodata/`) and the `.rpm` pool (`<channel>/packages/`)
+live in Cloudflare R2 (bucket `wheels-yum`), served at https://yum.wheels.dev via
+R2 custom-domain. The receiver workflow regenerates metadata + uploads to R2 on every
+release. End users do:
 
 ```bash
 # Stable
@@ -47,7 +50,7 @@ gh workflow run wheels-released.yml \
 | `wheels-be.repo` | Bleeding-edge `.repo` file, served at `https://yum.wheels.dev/wheels-be.repo`. |
 | `index.html` | Plain-HTML landing page served at the apex. |
 | `wheels.gpg.placeholder` | Reminder file — **must be replaced with the real ASCII-armored public key** committed as `wheels.gpg` at the repo root before the first release publish. See "Operational setup" below. |
-| `stable/`, `bleeding-edge/` | Populated at first publish: `<channel>/packages/<pkg>-<v>.x86_64.rpm` and `<channel>/repodata/`. |
+
 
 ## Distribution layout (post-first-publish)
 
@@ -104,13 +107,15 @@ Before this repo will publish a usable repository:
    Public key (ASCII-armored) replaces `wheels.gpg.placeholder` with a
    committed `wheels.gpg` at the repo root.
 
-2. **Cloudflare Pages** — create a Pages project pointing at this repo, bind
-   the apex domain `yum.wheels.dev`. Build command is empty; output dir is `./`.
+2. **Cloudflare R2 bucket** — create the `wheels-yum` bucket, attach the
+   `yum.wheels.dev` custom domain. R2 has no per-object size limit (vs.
+   Cloudflare Pages' 25 MiB) which is why we serve from R2 rather than Pages.
 
 3. **CI secrets** at
    <https://github.com/wheels-dev/yum-wheels/settings/secrets/actions>:
    - `WHEELS_REPO_GPG_PRIVATE_KEY` — ASCII-armored private key
    - `WHEELS_REPO_GPG_PASSPHRASE` — passphrase
+   - `CLOUDFLARE_API_TOKEN` — token with `Workers R2 Storage:Edit` on this account
 
 4. **Upstream dispatch token** — on `wheels-dev/wheels`, add
    `LINUX_REPO_DISPATCH_TOKEN` (fine-grained PAT with `actions: write` on this
