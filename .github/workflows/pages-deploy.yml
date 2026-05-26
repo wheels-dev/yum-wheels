@@ -1,0 +1,46 @@
+# Deploys the bucket-repo tree to the `wheels-yum` Cloudflare Pages project on
+# every push to main. Pairs with `wheels-released.yml` (the receiver workflow):
+#
+#   1. `wheels-released.yml` regenerates yum metadata, commits, and pushes main.
+#   2. This workflow fires on that push, runs `wrangler pages deploy`, which
+#      uploads the current tree to https://yum.wheels.dev (and to the bare
+#      *.pages.dev preview).
+#
+# Why separate from the receiver: the receiver concerns itself with metadata
+# correctness (createrepo_c + GPG); this one concerns itself with shipping
+# bytes to the CDN. Splitting keeps each workflow easy to re-run independently
+# on failure.
+#
+# Manual dispatch is available via `workflow_dispatch` to redeploy without a
+# new push.
+
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-deploy-yum
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ github.sha }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Deploy to Cloudflare Pages (wheels-yum)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: "511d04f367103ec276d875ab41a24dea"
+          command: pages deploy ./ --project-name=wheels-yum --branch=main --commit-dirty=true
