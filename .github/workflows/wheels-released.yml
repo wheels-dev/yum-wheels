@@ -198,26 +198,70 @@ jobs:
           CHANNEL: ${{ steps.inputs.outputs.channel }}
         run: |
           set -euo pipefail
+          # Cache-Control is the fix for the stale-metadata failure (the yum
+          # analogue of apt #3218): Cloudflare auto-caches by file extension, so
+          # a published repomd.xml / *-primary.xml.gz can be edge-cached and kept
+          # being served after the next publish rewrites it, leaving dnf with a
+          # repomd that points at checksums the served metadata no longer has
+          # ("Status code: 404"/"checksum mismatch"). repodata changes every
+          # publish, so it must never be edge-cached: tag it `no-store`. The
+          # .rpm packages are immutable (version-stamped) -> long immutable cache.
+          RPM_CC="public, max-age=31536000, immutable"
+          META_CC="no-store, max-age=0"
           upload_one() {
-            local local_path="$1"
-            local ct="$2"
-            local key="$local_path"
-            echo "  uploading $key (ct=${ct})"
-            wrangler r2 object put "${R2_BUCKET}/${key}" --file="$local_path" --content-type="$ct" --remote >/dev/null 2>&1
+            local local_path="$1" ct="$2" cc="$3" key="$1"
+            echo "  uploading $key (ct=${ct}; cache-control=${cc})"
+            wrangler r2 object put "${R2_BUCKET}/${key}" \
+              --file="$local_path" --content-type="$ct" --cache-control="$cc" --remote >/dev/null 2>&1
           }
+          # Collect absolute URLs we touch so the purge step can evict legacy
+          # cached copies (objects cached before no-store linger until old TTL).
+          : > /tmp/purge-urls.txt
           # Walk the channel tree and upload every file. createrepo_c is
-          # idempotent — files unchanged from prior runs will overwrite
-          # with the same bytes. New .rpm + regenerated repodata/ are the
-          # only meaningful diffs.
+          # idempotent — files unchanged from prior runs overwrite with the same
+          # bytes. New .rpm + regenerated repodata/ are the only meaningful diffs.
           find "${CHANNEL}" -type f | while read -r f; do
             case "$f" in
-              *.rpm)        ct="application/x-rpm" ;;
-              *.xml)        ct="application/xml" ;;
-              *.xml.gz)     ct="application/gzip" ;;
-              *.asc)        ct="application/pgp-signature" ;;
-              *.key)        ct="application/pgp-keys" ;;
-              *)            ct="application/octet-stream" ;;
+              *.rpm)        ct="application/x-rpm"; cc="$RPM_CC" ;;
+              *.xml)        ct="application/xml"; cc="$META_CC" ;;
+              *.xml.gz)     ct="application/gzip"; cc="$META_CC" ;;
+              *.asc)        ct="application/pgp-signature"; cc="$META_CC" ;;
+              *.key)        ct="application/pgp-keys"; cc="$META_CC" ;;
+              *)            ct="application/octet-stream"; cc="$META_CC" ;;
             esac
-            upload_one "$f" "$ct"
+            upload_one "$f" "$ct" "$cc"
+            echo "https://yum.wheels.dev/$f" >> /tmp/purge-urls.txt
           done
           echo "R2 upload complete for channel=${CHANNEL}."
+
+      - name: Purge Cloudflare edge cache for the published files
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Best-effort: no-store (above) prevents future staleness on its own,
+          # so this never fails the publish — it just evicts copies cached before
+          # no-store existed so dnf sees the new repodata immediately. If the
+          # token lacks Zone.Cache-Purge scope we warn and rely on no-store+TTL.
+          [ -s /tmp/purge-urls.txt ] || { echo "No URLs to purge."; exit 0; }
+          ZONE_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/zones?name=wheels.dev" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[0].id // empty')"
+          if [ -z "$ZONE_ID" ]; then
+            echo "::warning::Could not resolve the wheels.dev zone id (token may lack Zone scope). Skipping purge; no-store keeps future publishes fresh and the legacy cached entry clears on its own TTL."
+            exit 0
+          fi
+          mapfile -t urls < /tmp/purge-urls.txt
+          i=0
+          while [ "$i" -lt "${#urls[@]}" ]; do
+            batch=("${urls[@]:i:30}")
+            payload="$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{files: .}')"
+            resp="$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" --data "$payload" || true)"
+            if [ "$(jq -r '.success // false' <<<"$resp")" = "true" ]; then
+              echo "Purged ${#batch[@]} url(s)."
+            else
+              echo "::warning::Purge request did not report success (token scope?): $(jq -rc '.errors // .' <<<"$resp" 2>/dev/null || echo "$resp")"
+            fi
+            i=$((i + 30))
+          done
