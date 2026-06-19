@@ -159,7 +159,7 @@ jobs:
           set -euo pipefail
           mkdir -p incoming
           URL_VERSION="${VERSION/-snapshot./.snapshot.}"
-          ASSET="${PKG}-${URL_VERSION}.x86_64.rpm"
+          ASSET="${PKG}-${URL_VERSION}.noarch.rpm"
           TAG="v${VERSION}"
           echo "Fetching ${ASSET} from ${UPSTREAM_REPO}@${TAG}"
           gh release download "$TAG" \
@@ -178,9 +178,9 @@ jobs:
           PKG_DIR="${CHANNEL}/packages"
           mkdir -p "$PKG_DIR"
           URL_VERSION="${VERSION/-snapshot./.snapshot.}"
-          mv "incoming/${PKG}-${URL_VERSION}.x86_64.rpm" \
-             "${PKG_DIR}/${PKG}-${VERSION}.x86_64.rpm"
-          echo "Placed: ${PKG_DIR}/${PKG}-${VERSION}.x86_64.rpm"
+          mv "incoming/${PKG}-${URL_VERSION}.noarch.rpm" \
+             "${PKG_DIR}/${PKG}-${VERSION}.noarch.rpm"
+          echo "Placed: ${PKG_DIR}/${PKG}-${VERSION}.noarch.rpm"
 
       - name: Regenerate yum metadata + sign
         env:
