@@ -236,18 +236,25 @@ jobs:
 
       - name: Purge Cloudflare edge cache for the published files
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Cache purge is a SEPARATE Cloudflare permission (Zone.Cache-Purge)
+          # from R2 (account-scoped). The shared CLOUDFLARE_API_TOKEN only has
+          # R2 + Zone:Read, so purge with it returns 401. Use a dedicated
+          # CF_PURGE_TOKEN (Zone.Cache-Purge on the wheels.dev zone) if one is
+          # configured; otherwise skip — `no-store` on the repodata (set in the
+          # upload step) already guarantees the edge never serves stale metadata,
+          # so the purge is an optional latency optimization, not correctness.
+          CF_PURGE_TOKEN: ${{ secrets.CF_PURGE_TOKEN }}
         run: |
           set -uo pipefail
-          # Best-effort: no-store (above) prevents future staleness on its own,
-          # so this never fails the publish — it just evicts copies cached before
-          # no-store existed so dnf sees the new repodata immediately. If the
-          # token lacks Zone.Cache-Purge scope we warn and rely on no-store+TTL.
           [ -s /tmp/purge-urls.txt ] || { echo "No URLs to purge."; exit 0; }
+          if [ -z "${CF_PURGE_TOKEN:-}" ]; then
+            echo "No CF_PURGE_TOKEN configured — skipping purge. (no-store keeps every publish fresh at the edge; add a Zone.Cache-Purge token as CF_PURGE_TOKEN to evict legacy entries immediately.)"
+            exit 0
+          fi
           ZONE_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/zones?name=wheels.dev" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[0].id // empty')"
+            -H "Authorization: Bearer ${CF_PURGE_TOKEN}" | jq -r '.result[0].id // empty')"
           if [ -z "$ZONE_ID" ]; then
-            echo "::warning::Could not resolve the wheels.dev zone id (token may lack Zone scope). Skipping purge; no-store keeps future publishes fresh and the legacy cached entry clears on its own TTL."
+            echo "::warning::CF_PURGE_TOKEN is set but the wheels.dev zone could not be resolved (token scope?). Relying on no-store."
             exit 0
           fi
           mapfile -t urls < /tmp/purge-urls.txt
@@ -256,12 +263,12 @@ jobs:
             batch=("${urls[@]:i:30}")
             payload="$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{files: .}')"
             resp="$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Authorization: Bearer ${CF_PURGE_TOKEN}" \
               -H "Content-Type: application/json" --data "$payload" || true)"
             if [ "$(jq -r '.success // false' <<<"$resp")" = "true" ]; then
               echo "Purged ${#batch[@]} url(s)."
             else
-              echo "::warning::Purge request did not report success (token scope?): $(jq -rc '.errors // .' <<<"$resp" 2>/dev/null || echo "$resp")"
+              echo "::warning::CF_PURGE_TOKEN purge did not report success: $(jq -rc '.errors // .' <<<"$resp" 2>/dev/null || echo "$resp")"
             fi
             i=$((i + 30))
           done
