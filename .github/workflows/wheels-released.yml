@@ -127,40 +127,49 @@ jobs:
           CHANNEL: ${{ steps.inputs.outputs.channel }}
         run: |
           set -euo pipefail
-          # Incremental regen: download only the channel's existing repodata (a
-          # handful of small metadata files) instead of the whole channel (~18 GB
-          # of .rpm files). regenerate-yum-metadata.sh merges this with the new
-          # package via mergerepo_c --all, preserving history without re-pulling
-          # the historical .rpm files.
+          # Incremental regen: download only the channel's CURRENT repodata — the
+          # handful of metadata files referenced by repomd.xml — instead of the
+          # whole channel (~18 GB of .rpm files) or every orphaned metadata
+          # object that has accumulated under repodata/. regenerate-yum-metadata.sh
+          # merges this with the new package via mergerepo_c --all.
           r2get() {
             local key="$1" attempt out
             for attempt in 1 2 3; do
               if out="$(wrangler r2 object get "${R2_BUCKET}/${key}" --file="$key" --remote 2>&1)"; then
                 return 0
               fi
+              # Missing key is not an error here — the caller decides how to handle it.
+              if echo "$out" | grep -qiE "does not exist|NoSuchKey|NoSuchObject"; then
+                return 1
+              fi
               echo "::warning::r2 object get failed for ${key} (attempt ${attempt}/3): ${out}" >&2
               sleep $((attempt * 5))
             done
             echo "::error::r2 object get failed permanently for ${key}" >&2
-            return 1
+            return 2
           }
           mkdir -p "${CHANNEL}/repodata"
-          PREFIX="${CHANNEL}/repodata/"
-          CURSOR=""
-          while :; do
-            URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/objects?prefix=${PREFIX}&per_page=1000"
-            [ -n "$CURSOR" ] && URL="${URL}&cursor=${CURSOR}"
-            RESP=$(curl -sS "$URL" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-            echo "$RESP" | jq -r '.result[].key' | while IFS= read -r key; do
-              [ -z "$key" ] && continue
-              mkdir -p "$(dirname "$key")"
-              echo "  pulling $key"
-              r2get "$key"
-            done
-            CURSOR=$(echo "$RESP" | jq -r '.result_info.cursor // empty')
-            [ -z "$CURSOR" ] && break
-          done
-          echo "Existing repodata for ${CHANNEL}:"
+          # repomd.xml is the trust root: it enumerates the current metadata set.
+          if ! r2get "${CHANNEL}/repodata/repomd.xml"; then
+            rc=$?
+            if [ "$rc" -eq 1 ]; then
+              echo "No existing repomd.xml — first publish on this channel; the regen script builds the first repodata."
+              exit 0
+            fi
+            exit 1
+          fi
+          # Download only the files repomd.xml references (hrefs are relative to
+          # the channel dir, e.g. repodata/<sha256>-primary.xml.gz).
+          grep -oE 'href="[^"]+"' "${CHANNEL}/repodata/repomd.xml" \
+            | sed -E 's/^href="//; s/"$//' \
+            | while IFS= read -r href; do
+                [ -z "$href" ] && continue
+                key="${CHANNEL}/${href}"
+                mkdir -p "$(dirname "$key")"
+                echo "  pulling $key"
+                r2get "$key"
+              done
+          echo "Pulled current repodata for ${CHANNEL}:"
           find "${CHANNEL}/repodata/" -type f | head -30 || true
 
       - name: Download new .rpm from upstream Release
@@ -255,6 +264,54 @@ jobs:
             echo "https://yum.wheels.dev/$f" >> /tmp/purge-urls.txt
           done
           echo "R2 upload complete for channel=${CHANNEL}."
+
+      - name: Delete orphaned repodata objects from R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CHANNEL: ${{ steps.inputs.outputs.channel }}
+        run: |
+          set -euo pipefail
+          # Each publish rewrites repodata with fresh checksum-named metadata
+          # files; the previous sets are left orphaned in R2. Delete every object
+          # under <channel>/repodata/ that isn't in the current (just-uploaded)
+          # tree. Fixed-name files (repomd.xml, .asc, .key) are always current
+          # and match by name, so they're never deleted.
+          #
+          # Best-effort: a failed delete leaves harmless dead weight, so we warn
+          # and continue rather than failing an already-successful publish.
+          r2delete() {
+            local key="$1" attempt out
+            for attempt in 1 2 3; do
+              if out="$(wrangler r2 object delete "${R2_BUCKET}/${key}" --remote 2>&1)"; then
+                echo "  deleted ${key}"
+                return 0
+              fi
+              echo "::warning::delete failed for ${key} (attempt ${attempt}/3): ${out}" >&2
+              sleep $((attempt * 5))
+            done
+            echo "::warning::failed to delete orphaned ${key} after 3 attempts" >&2
+            return 0
+          }
+          # Current set = basenames of the local (merged, just-uploaded) repodata.
+          find "${CHANNEL}/repodata/" -type f -printf '%f\n' | sort > /tmp/current-repodata-names.txt
+          PREFIX="${CHANNEL}/repodata/"
+          CURSOR=""
+          while :; do
+            URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/objects?prefix=${PREFIX}&per_page=1000"
+            [ -n "$CURSOR" ] && URL="${URL}&cursor=${CURSOR}"
+            RESP=$(curl -sS "$URL" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            echo "$RESP" | jq -r '.result[].key' | while IFS= read -r key; do
+              [ -z "$key" ] && continue
+              base="$(basename "$key")"
+              if grep -qxF "$base" /tmp/current-repodata-names.txt; then
+                continue
+              fi
+              r2delete "$key"
+            done
+            CURSOR=$(echo "$RESP" | jq -r '.result_info.cursor // empty')
+            [ -z "$CURSOR" ] && break
+          done
+          echo "Orphaned repodata cleanup complete."
 
       - name: Purge Cloudflare edge cache for the published files
         env:
