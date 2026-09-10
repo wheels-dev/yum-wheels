@@ -121,19 +121,17 @@ jobs:
           echo "$FINGERPRINT:6:" | gpg --batch --yes --import-ownertrust
           echo "GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
 
-      - name: Sync existing channel from R2
+      - name: Pull existing repodata from R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CHANNEL: ${{ steps.inputs.outputs.channel }}
         run: |
           set -euo pipefail
-          # Retry transient R2 failures (timeouts / 5xx / connection resets).
-          # The channel is unbounded and re-downloaded in full on every publish,
-          # so the sync is a long sequence of single-shot `wrangler r2 object
-          # get` calls; one transient failure used to kill the whole run. 3
-          # attempts with backoff absorbs that, and failures are logged instead
-          # of being discarded to /dev/null so a persistent error stays
-          # diagnosable.
+          # Incremental regen: download only the channel's existing repodata (a
+          # handful of small metadata files) instead of the whole channel (~18 GB
+          # of .rpm files). regenerate-yum-metadata.sh merges this with the new
+          # package via mergerepo_c --all, preserving history without re-pulling
+          # the historical .rpm files.
           r2get() {
             local key="$1" attempt out
             for attempt in 1 2 3; do
@@ -146,11 +144,8 @@ jobs:
             echo "::error::r2 object get failed permanently for ${key}" >&2
             return 1
           }
-          # createrepo_c rescans <channel>/packages/ on each run, so we need
-          # ALL previously-published .rpm files locally to keep them in the
-          # repodata. Pull the whole channel down before adding the new one.
-          mkdir -p "${CHANNEL}/packages"
-          PREFIX="${CHANNEL}/"
+          mkdir -p "${CHANNEL}/repodata"
+          PREFIX="${CHANNEL}/repodata/"
           CURSOR=""
           while :; do
             URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/objects?prefix=${PREFIX}&per_page=1000"
@@ -165,12 +160,8 @@ jobs:
             CURSOR=$(echo "$RESP" | jq -r '.result_info.cursor // empty')
             [ -z "$CURSOR" ] && break
           done
-          echo "Local ${CHANNEL}/ contents after sync:"
-          # Diagnostic only. head closes the pipe after 20 lines; find then
-          # gets SIGPIPE. Under `set -euo pipefail` that fails the step even
-          # though the wrangler pull already finished (run 369 / snapshot 2316:
-          # last object bleeding-edge/repodata/repomd.xml, then this listing).
-          find "${CHANNEL}/" -type f | head -20 || true
+          echo "Existing repodata for ${CHANNEL}:"
+          find "${CHANNEL}/repodata/" -type f | head -30 || true
 
       - name: Download new .rpm from upstream Release
         env:

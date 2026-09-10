@@ -1,15 +1,24 @@
 #!/bin/bash
-# Regenerates yum metadata for both `stable` and `bleeding-edge` channels
-# under the bucket-repo root, then signs `repomd.xml` with GPG (detached →
-# `repomd.xml.asc`).
+# Incrementally regenerates yum metadata for one dispatched channel, then signs
+# `repomd.xml` with GPG (detached → `repomd.xml.asc`).
+#
+# This is the incremental replacement for the old full-channel scan. The old
+# flow ran `createrepo_c --update` over EVERY historical .rpm, which forced the
+# workflow to re-download the whole channel (~18 GB, hundreds of files, ~15 min
+# and growing) on every publish. Instead:
+#
+#   * the workflow slots the single new .rpm into <channel>/packages/ and
+#     downloads the channel's existing repodata/ from R2 into
+#     <channel>/repodata/,
+#   * this script signs the new .rpm, builds a throwaway single-package repo,
+#     and merges it with the existing repodata via `mergerepo_c --all` — which
+#     preserves every historical version WITHOUT needing those .rpm files on
+#     disk (createrepo_c --update alone would DROP them, verified empirically).
 #
 # Inputs (env vars):
 #   GPG_PASSPHRASE  — passphrase for the imported signing key
 #   GPG_KEY_ID      — long-form key ID (set by the workflow after `gpg --import`)
-#
-# Idempotent: safe to run by hand against an existing tree. `createrepo_c`
-# rebuilds the metadata from the current state of <channel>/packages/, so
-# stale entries get cleared automatically.
+#   CHANNEL         — single channel to regenerate ("stable" or "bleeding-edge")
 
 set -euo pipefail
 
@@ -18,28 +27,34 @@ if [ -z "${GPG_KEY_ID:-}" ]; then
   exit 1
 fi
 
-CHANNELS="stable bleeding-edge"
+CHANNEL="${CHANNEL:-}"
+if [ -z "$CHANNEL" ]; then
+  echo "::error::CHANNEL is unset — must be the single dispatched channel."
+  exit 1
+fi
 
-# nfpm produces unsigned .rpm files. The wheels.repo / wheels-be.repo files
-# served by this bucket set gpgcheck=1, so dnf REJECTS unsigned packages with
-# "Package is not signed: GPG check FAILED". Sign every .rpm in the channel's
-# packages/ dir before regenerating metadata — rpm --addsign embeds the
-# signature in the .rpm header, which createrepo_c then records in the
-# primary.xml.gz hash chain. Re-runs are idempotent (rpm --addsign replaces
-# any existing signature).
+CHANNEL_DIR="$CHANNEL"
+PKG_DIR="${CHANNEL_DIR}/packages"
+
+# Only the just-slotted .rpm is present locally (the channel is not synced).
+NEW_RPM=$(find "$PKG_DIR" -type f -name '*.rpm' 2>/dev/null | head -1 || true)
+if [ -z "$NEW_RPM" ]; then
+  echo "::error::No .rpm under ${PKG_DIR} to publish."
+  exit 1
+fi
+echo "── Incrementally updating ${CHANNEL_DIR}/ with $(basename "$NEW_RPM") ──"
+
+# nfpm produces unsigned .rpm files; the .repo files set gpgcheck=1, so dnf
+# REJECTS unsigned packages. rpm --addsign embeds the signature in the .rpm
+# header, which createrepo_c then records in primary.xml.gz.
 #
-# Requires rpm-sign (Fedora/RHEL) for the rpm command itself.
-#
-# Why a custom %__gpg_sign_cmd: in CI there is no TTY, so the default
-# rpm-build sign command (`gpg ... --pinentry-mode loopback --passphrase-fd 3 ...`)
-# either fails to open /dev/tty or has no fd 3 wired up. Override with an
-# explicit `--passphrase-file` pointing at a chmod-600 file we control. The
-# file lives under $RUNNER_TEMP (or /tmp as a fallback), is unreadable by
-# other users, and is wiped at the end of the script.
+# Requires rpm-sign for the rpm command. (Same rationale + macro setup as the
+# previous full-scan script; see there for why a custom %__gpg_sign_cmd.)
 PASS_FILE="${RUNNER_TEMP:-/tmp}/wheels-rpm-pass.$$"
 umask 077
 printf '%s' "${GPG_PASSPHRASE:-}" > "$PASS_FILE"
-trap 'rm -f "$PASS_FILE"' EXIT
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP" "$PASS_FILE"' EXIT
 
 cat > ~/.rpmmacros <<RPMMACROS
 %_signature gpg
@@ -49,9 +64,6 @@ cat > ~/.rpmmacros <<RPMMACROS
 %__gpg_sign_cmd %{__gpg} --batch --no-armor --no-secmem-warning --pinentry-mode loopback --passphrase-file ${PASS_FILE} --local-user "%{_gpg_name}" --sign --detach-sign --output %{__signature_filename} %{__plaintext_filename}
 RPMMACROS
 
-# Also configure gpg-agent to allow loopback (belt-and-braces — the macro
-# above is the load-bearing piece, but other gpg invocations later in the
-# script — repomd.xml signing, public-key export — still rely on the agent).
 mkdir -p "${GNUPGHOME:-${HOME}/.gnupg}"
 cat > "${GNUPGHOME:-${HOME}/.gnupg}/gpg-agent.conf" <<GPGAGENT
 allow-loopback-pinentry
@@ -62,60 +74,60 @@ pinentry-mode loopback
 GPGCONF
 gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
 
-for CHANNEL in $CHANNELS; do
-  CHANNEL_DIR="$CHANNEL"
-  PKG_DIR="${CHANNEL_DIR}/packages"
+# --- 1) Sign the new .rpm (the only one present). ---
+echo "── Signing ${NEW_RPM} ──"
+rpm --addsign "$NEW_RPM" >/dev/null
+echo "  ✓ signed $(basename "$NEW_RPM")"
 
-  # Skip channels that don't have any packages yet (first run after bucket creation).
-  if [ ! -d "$PKG_DIR" ] || [ -z "$(ls -A "$PKG_DIR" 2>/dev/null | grep -E '\.rpm$' || true)" ]; then
-    echo "── Skipping ${CHANNEL} (no .rpm files in ${PKG_DIR}) ──"
-    continue
-  fi
+# --- 2) Build a throwaway single-package repo around it. ---
+mkdir -p "$TMP/newrepo/packages"
+cp "$NEW_RPM" "$TMP/newrepo/packages/"
+createrepo_c --quiet "$TMP/newrepo"
 
-  echo "── Signing .rpm files in ${PKG_DIR}/ ──"
-  for rpm_file in "${PKG_DIR}"/*.rpm; do
-    [ -f "$rpm_file" ] || continue
-    # --addsign with the macro setup above. Passphrase via env (rpm reads
-    # $GNUPGHOME/gpg.conf which sets pinentry-mode loopback).
-    rpm --addsign "$rpm_file" >/dev/null
-    echo "  ✓ signed $(basename "$rpm_file")"
-  done
+# --- 3) Merge existing repodata (pulled by the workflow) with the new repo. ---
+# --all keeps every historical version of same-name packages; --omit-baseurl
+# keeps `location href` relative (packages/<file>.rpm) so dnf resolves them
+# against <channel>/, where the historical .rpm files live in R2; --compress-type
+# gz matches the existing repo's primary index format.
+echo "── Merging existing repodata with the new package ──"
+if [ -f "${CHANNEL_DIR}/repodata/repomd.xml" ]; then
+  mergerepo_c \
+    --repo "$CHANNEL_DIR" \
+    --repo "$TMP/newrepo" \
+    -o "$TMP/merged" \
+    --compress-type gz \
+    --all \
+    --omit-baseurl
 
-  echo "── Regenerating ${CHANNEL_DIR}/repodata/ ──"
+  rm -rf "${CHANNEL_DIR}/repodata"
+  mv "$TMP/merged/repodata" "${CHANNEL_DIR}/repodata"
+else
+  # First publish on this channel: no existing repodata to merge — the
+  # throwaway single-package repo becomes the first repodata.
+  rm -rf "${CHANNEL_DIR}/repodata"
+  mv "$TMP/newrepo/repodata" "${CHANNEL_DIR}/repodata"
+fi
 
-  # createrepo_c scans <channel>/packages/ and writes <channel>/repodata/.
-  # --update reuses existing metadata where possible (faster on large pools).
-  createrepo_c \
-    --update \
-    --workers 2 \
-    --general-compress-type=gz \
-    --xz \
-    "$CHANNEL_DIR"
+# --- 4) Sign the merged repomd.xml + export the public key. ---
+REPOMD="${CHANNEL_DIR}/repodata/repomd.xml"
+if [ ! -f "$REPOMD" ]; then
+  echo "::error::mergerepo_c didn't produce ${REPOMD}"
+  exit 1
+fi
 
-  REPOMD="${CHANNEL_DIR}/repodata/repomd.xml"
-  if [ ! -f "$REPOMD" ]; then
-    echo "::error::createrepo_c didn't produce ${REPOMD}"
-    exit 1
-  fi
+rm -f "${REPOMD}.asc"
+gpg --batch --yes \
+  --pinentry-mode loopback \
+  --passphrase "${GPG_PASSPHRASE:-}" \
+  --default-key "$GPG_KEY_ID" \
+  --armor --detach-sign \
+  --output "${REPOMD}.asc" \
+  "$REPOMD"
 
-  # Detached signature on repomd.xml is the trust root — package checksums
-  # live inside the metadata, so signing repomd.xml signs the whole tree
-  # transitively.
-  rm -f "${REPOMD}.asc"
-  gpg --batch --yes \
-    --pinentry-mode loopback \
-    --passphrase "${GPG_PASSPHRASE:-}" \
-    --default-key "$GPG_KEY_ID" \
-    --armor --detach-sign \
-    --output "${REPOMD}.asc" \
-    "$REPOMD"
+# Some dnf clients fetch repomd.xml.key alongside repomd.xml.asc on first
+# refresh. Export the public key there so installs don't fail with
+# "GPG key not available" on hosts that don't pre-trust the key.
+gpg --armor --export "$GPG_KEY_ID" > "${CHANNEL_DIR}/repodata/repomd.xml.key"
 
-  # Some dnf clients fetch repomd.xml.key alongside repomd.xml.asc on first
-  # refresh. Export the public key there so installs don't fail with
-  # "GPG key not available" on hosts that don't pre-trust the key.
-  gpg --armor --export "$GPG_KEY_ID" > "${CHANNEL_DIR}/repodata/repomd.xml.key"
-
-  echo "  ✓ repodata + repomd.xml.asc + repomd.xml.key written for ${CHANNEL}"
-done
-
+echo "  ✓ repodata + repomd.xml.asc + repomd.xml.key written for ${CHANNEL}"
 echo "Done."
