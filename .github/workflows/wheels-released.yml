@@ -127,6 +127,25 @@ jobs:
           CHANNEL: ${{ steps.inputs.outputs.channel }}
         run: |
           set -euo pipefail
+          # Retry transient R2 failures (timeouts / 5xx / connection resets).
+          # The channel is unbounded and re-downloaded in full on every publish,
+          # so the sync is a long sequence of single-shot `wrangler r2 object
+          # get` calls; one transient failure used to kill the whole run. 3
+          # attempts with backoff absorbs that, and failures are logged instead
+          # of being discarded to /dev/null so a persistent error stays
+          # diagnosable.
+          r2get() {
+            local key="$1" attempt out
+            for attempt in 1 2 3; do
+              if out="$(wrangler r2 object get "${R2_BUCKET}/${key}" --file="$key" --remote 2>&1)"; then
+                return 0
+              fi
+              echo "::warning::r2 object get failed for ${key} (attempt ${attempt}/3): ${out}" >&2
+              sleep $((attempt * 5))
+            done
+            echo "::error::r2 object get failed permanently for ${key}" >&2
+            return 1
+          }
           # createrepo_c rescans <channel>/packages/ on each run, so we need
           # ALL previously-published .rpm files locally to keep them in the
           # repodata. Pull the whole channel down before adding the new one.
@@ -141,7 +160,7 @@ jobs:
               [ -z "$key" ] && continue
               mkdir -p "$(dirname "$key")"
               echo "  pulling $key"
-              wrangler r2 object get "${R2_BUCKET}/${key}" --file="$key" --remote >/dev/null 2>&1
+              r2get "$key"
             done
             CURSOR=$(echo "$RESP" | jq -r '.result_info.cursor // empty')
             [ -z "$CURSOR" ] && break
@@ -213,10 +232,18 @@ jobs:
           RPM_CC="public, max-age=31536000, immutable"
           META_CC="no-store, max-age=0"
           upload_one() {
-            local local_path="$1" ct="$2" cc="$3" key="$1"
+            local local_path="$1" ct="$2" cc="$3" key="$1" attempt out
             echo "  uploading $key (ct=${ct}; cache-control=${cc})"
-            wrangler r2 object put "${R2_BUCKET}/${key}" \
-              --file="$local_path" --content-type="$ct" --cache-control="$cc" --remote >/dev/null 2>&1
+            for attempt in 1 2 3; do
+              if out="$(wrangler r2 object put "${R2_BUCKET}/${key}" \
+                  --file="$local_path" --content-type="$ct" --cache-control="$cc" --remote 2>&1)"; then
+                return 0
+              fi
+              echo "::warning::r2 object put failed for ${key} (attempt ${attempt}/3): ${out}" >&2
+              sleep $((attempt * 5))
+            done
+            echo "::error::r2 object put failed permanently for ${key}" >&2
+            return 1
           }
           # Collect absolute URLs we touch so the purge step can evict legacy
           # cached copies (objects cached before no-store linger until old TTL).
