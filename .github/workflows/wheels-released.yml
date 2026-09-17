@@ -95,8 +95,12 @@ jobs:
       - name: Install createrepo_c + gpg + rpm + wrangler
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends createrepo-c gnupg rpm jq
+          # python3-createrepo-c provides the bindings repair-repodata.py uses to
+          # rewrite a re-cut version's primary.xml record so it matches the .rpm
+          # being published (see that script's header).
+          sudo apt-get install -y --no-install-recommends createrepo-c python3-createrepo-c gnupg rpm jq
           createrepo_c --version
+          python3 -c 'import createrepo_c; print("createrepo_c python bindings OK")'
           gpg --version | head -1
           rpm --version
           sudo npm install -g wrangler@4.95.0

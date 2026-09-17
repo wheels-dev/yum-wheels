@@ -89,11 +89,17 @@ createrepo_c --quiet "$TMP/newrepo"
 # keeps `location href` relative (packages/<file>.rpm) so dnf resolves them
 # against <channel>/, where the historical .rpm files live in R2; --compress-type
 # gz matches the existing repo's primary index format.
+# The NEW repo is listed first deliberately. mergerepo_c resolves a
+# name-version-arch collision in favour of the first repository that carries it,
+# so listing the existing channel first would let a re-cut publish keep the
+# PREVIOUS build's record (old checksum/size) for the version being republished.
+# The repair step below is the authoritative guard; this ordering just makes the
+# merge do the right thing to begin with.
 echo "── Merging existing repodata with the new package ──"
 if [ -f "${CHANNEL_DIR}/repodata/repomd.xml" ]; then
   mergerepo_c \
-    --repo "$CHANNEL_DIR" \
     --repo "$TMP/newrepo" \
+    --repo "$CHANNEL_DIR" \
     -o "$TMP/merged" \
     --compress-type gz \
     --all \
@@ -107,6 +113,22 @@ else
   rm -rf "${CHANNEL_DIR}/repodata"
   mv "$TMP/newrepo/repodata" "${CHANNEL_DIR}/repodata"
 fi
+
+# --- 3b) Make the metadata agree with the .rpm we are actually publishing. ---
+# A re-cut reuses the version number, so the merge above can retain the
+# previous build's primary.xml record (old checksum + size) for this version.
+# The pool object is then overwritten with the new build, leaving the channel
+# advertising a file that no longer exists -- dnf downloads the served .rpm,
+# fails validation, and reports "checksum doesn't match ... All mirrors were
+# tried". Rewrite the record from the artifact we hold so that cannot happen.
+#
+# Requires the createrepo_c Python bindings (python3-createrepo-c), which ship
+# alongside createrepo_c on the runner image.
+echo "── Verifying repodata matches the published package ──"
+NEW_SHA=$(sha256sum "$NEW_RPM" | awk '{print $1}')
+NEW_SIZE=$(stat -c '%s' "$NEW_RPM")
+python3 "$(dirname "$0")/repair-repodata.py" \
+  "$CHANNEL_DIR" "$(basename "$NEW_RPM")" "$NEW_SHA" "$NEW_SIZE"
 
 # --- 4) Sign the merged repomd.xml + export the public key. ---
 REPOMD="${CHANNEL_DIR}/repodata/repomd.xml"
