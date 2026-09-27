@@ -25,8 +25,10 @@ Commands
       matches the bytes. Exits 1 with one line per mismatch.
 
   repodata-integrity.py exists <channel-dir> <pkg> <version>
-      Exit 0 if primary lists packages/<pkg>-<version>.<arch>.rpm, else 1. Used
-      by the publish guard: a published version is immutable.
+      Exit 0 if primary lists packages/<pkg>-<version>.<arch>.rpm, 1 if it
+      does not, and 2 if primary cannot be read (missing, corrupt, not
+      primary metadata). Used by the publish guard, which fails closed on 2: a
+      published version is immutable.
 """
 
 import gzip
@@ -151,15 +153,29 @@ def verify(channel):
 
 
 def exists(channel, pkg, version):
-    repomd = open(_repomd_path(channel), encoding="utf-8").read()
-    for _, _, kind, body in _blocks(repomd):
-        if kind != "primary":
-            continue
-        raw = open(os.path.join(channel, _href(body)), "rb").read()
-        text = gzip.decompress(raw).decode("utf-8", "replace") if _href(body).endswith(".gz") else raw.decode("utf-8", "replace")
-        pattern = r'<location href="packages/' + re.escape(f"{pkg}-{version}") + r'\.[A-Za-z0-9_]+\.rpm"'
-        return 0 if re.search(pattern, text) else 1
-    return 1
+    """0 = listed, 1 = not listed (primary read cleanly), 2 = cannot tell.
+
+    The guard must fail closed: a missing or corrupt primary is never read as
+    "this version is new".
+    """
+    try:
+        repomd = open(_repomd_path(channel), encoding="utf-8").read()
+        primaries = [body for _, _, kind, body in _blocks(repomd) if kind == "primary"]
+        if len(primaries) != 1:
+            print(f"::error::repomd.xml lists {len(primaries)} primary components; cannot tell whether {pkg}-{version} exists")
+            return 2
+        href = _href(primaries[0])
+        raw = open(os.path.join(channel, href or ""), "rb").read()
+        data = gzip.decompress(raw) if href.endswith(".gz") else raw
+        text = data.decode("utf-8")
+        if not re.search(r"<metadata\b[^>]*\bpackages=\"\d+\"", text):
+            print(f"::error::{href} does not look like primary metadata; cannot tell whether {pkg}-{version} exists")
+            return 2
+    except (OSError, EOFError, ValueError, gzip.BadGzipFile, UnicodeDecodeError) as exc:
+        print(f"::error::cannot read primary metadata ({exc}); cannot tell whether {pkg}-{version} exists")
+        return 2
+    pattern = r'<location href="packages/' + re.escape(f"{pkg}-{version}") + r'\.[A-Za-z0-9_]+\.rpm"'
+    return 0 if re.search(pattern, text) else 1
 
 
 def main(argv):

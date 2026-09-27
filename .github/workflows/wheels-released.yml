@@ -120,6 +120,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Seconds, stdlib only: a regression in the integrity/guard script stops
+      # the run before anything is pulled, signed or uploaded.
+      - name: Self-test repodata-integrity.py
+        run: python3 scripts/test_repodata_integrity.py
+
       - name: Install createrepo_c + gpg + rpm + wrangler
         run: |
           sudo apt-get update
@@ -182,12 +187,16 @@ jobs:
           }
           mkdir -p "${CHANNEL}/repodata"
           # repomd.xml is the trust root: it enumerates the current metadata set.
-          if ! r2get "${CHANNEL}/repodata/repomd.xml"; then
-            rc=$?
-            if [ "$rc" -eq 1 ]; then
-              echo "No existing repomd.xml — first publish on this channel; the regen script builds the first repodata."
-              exit 0
-            fi
+          # Capture the real exit code: inside `if ! cmd; then`, $? is the
+          # negated status (always 0), so "missing" and "failed" were
+          # indistinguishable.
+          rc=0
+          r2get "${CHANNEL}/repodata/repomd.xml" || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "No existing repomd.xml — first publish on this channel; the regen script builds the first repodata."
+            exit 0
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::Could not pull ${CHANNEL}/repodata/repomd.xml (r2get exit ${rc})."
             exit 1
           fi
           # Download only the files repomd.xml references (hrefs are relative to
@@ -222,7 +231,14 @@ jobs:
             echo "First publish on ${CHANNEL}; nothing to compare against."
             exit 0
           fi
-          if python3 scripts/repodata-integrity.py exists "$CHANNEL" "$PKG" "$VERSION"; then
+          # 0 = already published, 1 = new, 2 = cannot tell (fail closed).
+          rc=0
+          python3 scripts/repodata-integrity.py exists "$CHANNEL" "$PKG" "$VERSION" || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            echo "::error::Could not determine whether ${PKG}-${VERSION} is already published in ${CHANNEL} (exit ${rc}); refusing to publish."
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
             if [ "$ALLOW_REPUBLISH" = "true" ]; then
               echo "::warning::allow_republish is set: RE-SIGNING and OVERWRITING ${PKG}-${VERSION} in ${CHANNEL}. Its bytes change under a URL served as immutable; caches and mirrors holding the old .rpm will fail checksum until they refetch."
             else
@@ -344,10 +360,8 @@ jobs:
           # Collect absolute URLs we touch so the purge step can evict legacy
           # cached copies (objects cached before no-store linger until old TTL).
           : > /tmp/purge-urls.txt
-          # Walk the channel tree and upload every file. createrepo_c is
-          # idempotent — files unchanged from prior runs overwrite with the same
-          # bytes. New .rpm + regenerated repodata/ are the only meaningful diffs.
-          find "${CHANNEL}" -type f | while read -r f; do
+          upload_file() {
+            local f="$1" ct cc
             case "$f" in
               *.rpm)        ct="application/x-rpm"; cc="$RPM_CC" ;;
               *.xml)        ct="application/xml"; cc="$META_CC" ;;
@@ -358,6 +372,21 @@ jobs:
             esac
             upload_one "$f" "$ct" "$cc"
             echo "https://yum.wheels.dev/$f" >> /tmp/purge-urls.txt
+          }
+          # Upload order matters. repomd.xml is the index: it names the payload
+          # files by checksum. Upload every payload (and any .rpm) FIRST and
+          # repomd.xml + its signature LAST, so a client never fetches an index
+          # that points at files not uploaded yet (a #3218-class window). The
+          # old payloads stay until the orphan cleanup step, which runs after
+          # the new index is live.
+          REPOMD="${CHANNEL}/repodata/repomd.xml"
+          find "${CHANNEL}" -type f ! -path "$REPOMD" ! -path "${REPOMD}.asc" | sort | while read -r f; do
+            upload_file "$f"
+          done
+          for f in "$REPOMD" "${REPOMD}.asc"; do
+            if [ -f "$f" ]; then
+              upload_file "$f"
+            fi
           done
           echo "R2 upload complete for channel=${CHANNEL}."
 
