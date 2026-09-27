@@ -130,6 +130,16 @@ NEW_SIZE=$(stat -c '%s' "$NEW_RPM")
 python3 "$(dirname "$0")/repair-repodata.py" \
   "$CHANNEL_DIR" "$(basename "$NEW_RPM")" "$NEW_SHA" "$NEW_SIZE"
 
+# --- 3c) Make repomd.xml describe the files as they now are, then prove it. ---
+# The repair above rewrites payloads in place and patches only <checksum> and
+# <size>, so each payload's checksum-named filename and its <open-checksum> /
+# <open-size> still describe the pre-repair file (wheels-dev/wheels#3690).
+# Rename every payload to its real sha256, recompute every field, and refuse to
+# sign or publish repodata that fails the self-check.
+echo "── Normalizing repodata filenames + checksums ──"
+python3 "$(dirname "$0")/repodata-integrity.py" normalize "$CHANNEL_DIR"
+python3 "$(dirname "$0")/repodata-integrity.py" verify "$CHANNEL_DIR"
+
 # --- 4) Sign the merged repomd.xml + export the public key. ---
 REPOMD="${CHANNEL_DIR}/repodata/repomd.xml"
 if [ ! -f "$REPOMD" ]; then

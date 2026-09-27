@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Wheels version (e.g. 4.0.1 or 4.0.1-snapshot.1700)'
-        required: true
+        description: 'Wheels version (e.g. 4.0.1 or 4.0.1-snapshot.1700). Not used with repair_only.'
+        required: false
         type: string
       channel:
         description: 'Release channel'
@@ -34,6 +34,16 @@ on:
         options:
           - stable
           - bleeding-edge
+      repair_only:
+        description: 'Metadata only: normalize + verify + re-sign repodata/. Never downloads, re-signs or uploads an .rpm (#3690).'
+        required: false
+        default: false
+        type: boolean
+      allow_republish:
+        description: 'DANGER: re-sign and overwrite an .rpm whose version already exists in the channel (served as immutable).'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,28 +58,43 @@ env:
 
 jobs:
   publish:
-    name: Publish ${{ github.event.client_payload.version || inputs.version }} (${{ github.event.client_payload.channel || inputs.channel }})
+    name: ${{ inputs.repair_only && 'Repair repodata' || 'Publish' }} ${{ github.event.client_payload.version || inputs.version }} (${{ github.event.client_payload.channel || inputs.channel }})
     runs-on: ubuntu-latest
 
     steps:
       - name: Resolve inputs
         id: inputs
         env:
+          EVENT_NAME: ${{ github.event_name }}
           CLIENT_VERSION: ${{ github.event.client_payload.version }}
           CLIENT_CHANNEL: ${{ github.event.client_payload.channel }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_REPAIR_ONLY: ${{ inputs.repair_only }}
+          INPUT_ALLOW_REPUBLISH: ${{ inputs.allow_republish }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          MODE="publish"
+          ALLOW_REPUBLISH="false"
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
             VERSION="$CLIENT_VERSION"
             CHANNEL="$CLIENT_CHANNEL"
           else
             VERSION="$INPUT_VERSION"
             CHANNEL="$INPUT_CHANNEL"
+            [ "$INPUT_REPAIR_ONLY" = "true" ] && MODE="repair"
+            [ "$INPUT_ALLOW_REPUBLISH" = "true" ] && ALLOW_REPUBLISH="true"
           fi
-          if [ -z "$VERSION" ] || [ -z "$CHANNEL" ]; then
-            echo "::error::Both version and channel are required."
+          if [ -z "$CHANNEL" ]; then
+            echo "::error::channel is required."
+            exit 1
+          fi
+          if [ "$MODE" = "publish" ] && [ -z "$VERSION" ]; then
+            echo "::error::version is required unless repair_only is set."
+            exit 1
+          fi
+          if [ "$MODE" = "repair" ] && [ "$ALLOW_REPUBLISH" = "true" ]; then
+            echo "::error::repair_only never touches .rpm files; allow_republish makes no sense with it."
             exit 1
           fi
           case "$CHANNEL" in
@@ -85,7 +110,10 @@ jobs:
             echo "channel=$CHANNEL"
             echo "pkg=$PKG"
             echo "upstream_repo=$UPSTREAM_REPO"
+            echo "mode=$MODE"
+            echo "allow_republish=$ALLOW_REPUBLISH"
           } >> "$GITHUB_OUTPUT"
+          echo "Mode: $MODE (channel=$CHANNEL version=${VERSION:-n/a} allow_republish=$ALLOW_REPUBLISH)"
 
       - name: Checkout bucket repo
         uses: actions/checkout@v4
@@ -176,7 +204,37 @@ jobs:
           echo "Pulled current repodata for ${CHANNEL}:"
           find "${CHANNEL}/repodata/" -type f | head -30 || true
 
+      # A published .rpm is served as `immutable` for a year, and every publish
+      # re-signs it (rpm --addsign embeds a fresh signature), so re-publishing a
+      # version that already exists replaces those bytes under the same URL: a
+      # cache or mirror holding the old object then fails dnf's checksum (the
+      # #3218 failure mode). Refuse unless a human explicitly overrides (#3690).
+      - name: Refuse to re-publish an existing version
+        if: steps.inputs.outputs.mode == 'publish'
+        env:
+          CHANNEL: ${{ steps.inputs.outputs.channel }}
+          PKG: ${{ steps.inputs.outputs.pkg }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          ALLOW_REPUBLISH: ${{ steps.inputs.outputs.allow_republish }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "${CHANNEL}/repodata/repomd.xml" ]; then
+            echo "First publish on ${CHANNEL}; nothing to compare against."
+            exit 0
+          fi
+          if python3 scripts/repodata-integrity.py exists "$CHANNEL" "$PKG" "$VERSION"; then
+            if [ "$ALLOW_REPUBLISH" = "true" ]; then
+              echo "::warning::allow_republish is set: RE-SIGNING and OVERWRITING ${PKG}-${VERSION} in ${CHANNEL}. Its bytes change under a URL served as immutable; caches and mirrors holding the old .rpm will fail checksum until they refetch."
+            else
+              echo "::error::${PKG}-${VERSION} is already published in ${CHANNEL}. Published .rpm files are immutable: re-publishing re-signs the package and changes its bytes under the same URL. To repair metadata only, dispatch with repair_only=true. To deliberately replace the package (a re-cut), dispatch with allow_republish=true."
+              exit 1
+            fi
+          else
+            echo "${PKG}-${VERSION} is new in ${CHANNEL}."
+          fi
+
       - name: Download new .rpm from upstream Release
+        if: steps.inputs.outputs.mode == 'publish'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.inputs.outputs.version }}
@@ -196,6 +254,7 @@ jobs:
           ls -lh incoming/
 
       - name: Slot new .rpm into local channel
+        if: steps.inputs.outputs.mode == 'publish'
         env:
           VERSION: ${{ steps.inputs.outputs.version }}
           CHANNEL: ${{ steps.inputs.outputs.channel }}
@@ -210,6 +269,7 @@ jobs:
           echo "Placed: ${PKG_DIR}/${PKG}-${VERSION}.noarch.rpm"
 
       - name: Regenerate yum metadata + sign
+        if: steps.inputs.outputs.mode == 'publish'
         env:
           GPG_PASSPHRASE: ${{ secrets.WHEELS_REPO_GPG_PASSPHRASE }}
           GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
@@ -219,12 +279,44 @@ jobs:
           chmod +x scripts/regenerate-yum-metadata.sh
           ./scripts/regenerate-yum-metadata.sh
 
+      # repair_only: fix the channel's CURRENT repodata in place. No .rpm is
+      # downloaded, signed or uploaded; the served packages are untouched.
+      - name: Repair-only — normalize, self-check and re-sign repodata
+        if: steps.inputs.outputs.mode == 'repair'
+        env:
+          GPG_PASSPHRASE: ${{ secrets.WHEELS_REPO_GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
+          CHANNEL: ${{ steps.inputs.outputs.channel }}
+        run: |
+          set -euo pipefail
+          REPOMD="${CHANNEL}/repodata/repomd.xml"
+          if [ ! -f "$REPOMD" ]; then
+            echo "::error::No repodata was pulled for ${CHANNEL}; nothing to repair."
+            exit 1
+          fi
+          echo "── Before ──"
+          python3 scripts/repodata-integrity.py verify "$CHANNEL" || true
+          echo "── Normalizing ──"
+          python3 scripts/repodata-integrity.py normalize "$CHANNEL"
+          echo "── After ──"
+          python3 scripts/repodata-integrity.py verify "$CHANNEL"
+          rm -f "${REPOMD}.asc"
+          gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE:-}" \
+            --default-key "$GPG_KEY_ID" --armor --detach-sign --output "${REPOMD}.asc" "$REPOMD"
+          gpg --armor --export "$GPG_KEY_ID" > "${CHANNEL}/repodata/repomd.xml.key"
+          echo "  ✓ repodata normalized, verified and re-signed for ${CHANNEL}"
+
       - name: Upload channel tree to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CHANNEL: ${{ steps.inputs.outputs.channel }}
+          MODE: ${{ steps.inputs.outputs.mode }}
         run: |
           set -euo pipefail
+          if [ "$MODE" = "repair" ] && find "${CHANNEL}" -type f -name '*.rpm' | grep -q .; then
+            echo "::error::repair_only must never upload an .rpm, but one is present under ${CHANNEL}/."
+            exit 1
+          fi
           # Cache-Control is the fix for the stale-metadata failure (the yum
           # analogue of apt #3218): Cloudflare auto-caches by file extension, so
           # a published repomd.xml / *-primary.xml.gz can be edge-cached and kept
