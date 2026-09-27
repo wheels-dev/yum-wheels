@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "repodata-integrity.py")
@@ -128,6 +129,51 @@ class RepodataIntegrityTest(unittest.TestCase):
                 with open(path, "wb") as fh:
                     fh.write(data[: len(data) // 2])
         self.assertEqual(run("exists", ch, "wheels", "4.1.0")[0], 2)
+
+    def _primary_path(self, ch):
+        return next(os.path.join(ch, "repodata", n) for n in os.listdir(os.path.join(ch, "repodata"))
+                    if n.endswith("-primary.xml.gz"))
+
+    def _flip_to(self, ch, exc_type):
+        """Flip one byte of primary so that gzip.decompress raises exc_type."""
+        path = self._primary_path(ch)
+        with open(path, "rb") as fh:
+            original = fh.read()
+        for i in range(10, len(original)):  # past the gzip header
+            data = bytearray(original)
+            data[i] ^= 0xFF
+            try:
+                gzip.decompress(bytes(data))
+            except exc_type:
+                with open(path, "wb") as fh:
+                    fh.write(bytes(data))
+                return i
+            except Exception:
+                continue
+        self.fail(f"no single-byte flip of the fixture raises {exc_type.__name__}")
+
+    def test_exists_fails_closed_on_byte_flipped_gzip(self):
+        # A flip inside the deflate stream raises zlib.error, which escaped the
+        # old except list and exited 1 = "new". A flip that survives inflate
+        # fails the CRC (BadGzipFile). Both must be 2.
+        for exc_type in (zlib.error, gzip.BadGzipFile):
+            with self.subTest(exc=exc_type.__name__):
+                ch = make_channel(os.path.join(self.tmp, f"flip-{exc_type.__name__}"))
+                self._flip_to(ch, exc_type)
+                code, out = run("exists", ch, "wheels", "4.1.0")
+                self.assertEqual(code, 2, out)
+
+    def test_exists_fails_closed_when_bytes_do_not_match_repomd_checksum(self):
+        # Valid gzip, valid primary XML, but not the bytes repomd.xml vouches for.
+        ch = self.channel()
+        other = PRIMARY.replace("4.0.6", "4.0.5").encode("utf-8")
+        for name in os.listdir(os.path.join(ch, "repodata")):
+            if name.endswith("-primary.xml.gz"):
+                with open(os.path.join(ch, "repodata", name), "wb") as fh:
+                    fh.write(gzip.compress(other, 9, mtime=0))
+        code, out = run("exists", ch, "wheels", "4.1.0")
+        self.assertEqual(code, 2, out)
+        self.assertIn("<checksum>", out)
 
     def test_exists_fails_closed_on_non_primary_payload(self):
         ch = self.channel(primary_text="<html>404 Not Found</html>\n")

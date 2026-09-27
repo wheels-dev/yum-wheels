@@ -166,13 +166,20 @@ def exists(channel, pkg, version):
             return 2
         href = _href(primaries[0])
         raw = open(os.path.join(channel, href or ""), "rb").read()
+        # The bytes must be the ones repomd.xml vouches for before we trust
+        # what they say: this catches corruption even when it still
+        # decompresses into plausible XML.
+        recorded = _field(primaries[0], "checksum")
+        if recorded != hashlib.sha256(raw).hexdigest():
+            print(f"::error::{href} does not match the <checksum> repomd.xml records for it; cannot tell whether {pkg}-{version} exists")
+            return 2
         data = gzip.decompress(raw) if href.endswith(".gz") else raw
         text = data.decode("utf-8")
         if not re.search(r"<metadata\b[^>]*\bpackages=\"\d+\"", text):
             print(f"::error::{href} does not look like primary metadata; cannot tell whether {pkg}-{version} exists")
             return 2
-    except (OSError, EOFError, ValueError, gzip.BadGzipFile, UnicodeDecodeError) as exc:
-        print(f"::error::cannot read primary metadata ({exc}); cannot tell whether {pkg}-{version} exists")
+    except Exception as exc:  # noqa: BLE001 — any failure to read means "cannot tell", never "new"
+        print(f"::error::cannot read primary metadata ({type(exc).__name__}: {exc}); cannot tell whether {pkg}-{version} exists")
         return 2
     pattern = r'<location href="packages/' + re.escape(f"{pkg}-{version}") + r'\.[A-Za-z0-9_]+\.rpm"'
     return 0 if re.search(pattern, text) else 1
@@ -185,7 +192,15 @@ def main(argv):
     if len(argv) >= 3 and argv[1] == "verify":
         return verify(argv[2])
     if len(argv) >= 5 and argv[1] == "exists":
-        return exists(argv[2], argv[3], argv[4])
+        # Exit 1 means "not published", so an uncaught exception (which Python
+        # reports as exit 1) would read as "new". Anything unexpected is 2.
+        try:
+            return exists(argv[2], argv[3], argv[4])
+        except BaseException as exc:  # noqa: BLE001
+            if isinstance(exc, SystemExit) and exc.code in (0, 1, 2):
+                raise
+            print(f"::error::exists failed unexpectedly ({type(exc).__name__}: {exc}); cannot tell")
+            return 2
     print(__doc__)
     return 2
 
