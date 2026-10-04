@@ -11,11 +11,11 @@ release. End users do:
 
 ```bash
 # Stable
-sudo dnf config-manager --add-repo https://yum.wheels.dev/wheels.repo
+sudo curl -fsSL https://yum.wheels.dev/wheels.repo -o /etc/yum.repos.d/wheels.repo
 sudo dnf install wheels
 
 # Bleeding-edge — distinct package name (`wheels-be`) so it coexists with stable
-sudo dnf config-manager --add-repo https://yum.wheels.dev/wheels-be.repo
+sudo curl -fsSL https://yum.wheels.dev/wheels-be.repo -o /etc/yum.repos.d/wheels-be.repo
 sudo dnf install wheels-be
 ```
 
@@ -46,7 +46,7 @@ gh workflow run wheels-released.yml \
 |------|---------|
 | `.github/workflows/wheels-released.yml` | Receiver workflow — fires on `repository_dispatch` from `wheels-dev/wheels`. |
 | `scripts/regenerate-yum-metadata.sh` | Pure-bash wrapper around `rpm --addsign` + `createrepo_c` + `gpg --detach-sign`. Idempotent. |
-| `wheels.repo` | The `.repo` file users grab via `dnf config-manager --add-repo`. Served at `https://yum.wheels.dev/wheels.repo`. |
+| `wheels.repo` | The `.repo` file users download into `/etc/yum.repos.d/`. Served at `https://yum.wheels.dev/wheels.repo`. |
 | `wheels-be.repo` | Bleeding-edge `.repo` file, served at `https://yum.wheels.dev/wheels-be.repo`. |
 | `index.html` | Plain-HTML landing page served at the apex. |
 | `wheels.gpg.placeholder` | Reminder file — **must be replaced with the real ASCII-armored public key** committed as `wheels.gpg` at the repo root before the first release publish. See "Operational setup" below. |
@@ -134,7 +134,7 @@ Before this repo will publish a usable repository:
    Then verify on a fresh Fedora/RHEL host:
 
    ```bash
-   sudo dnf config-manager --add-repo https://yum.wheels.dev/wheels.repo
+   sudo curl -fsSL https://yum.wheels.dev/wheels.repo -o /etc/yum.repos.d/wheels.repo
    sudo dnf install wheels
    wheels --version
    sudo dnf --refresh check-update wheels
