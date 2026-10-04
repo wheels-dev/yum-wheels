@@ -1,0 +1,90 @@
+# Deploy the yum.wheels.dev landing page (index.html) to the R2 bucket.
+#
+# The publish workflow (wheels-released.yml) uploads only the channel trees (packages/ + repodata/), so
+# a change to index.html never reached the site. This workflow uploads that one
+# file and nothing else: it never touches packages, repodata or
+# signatures, so it is always safe to run.
+#
+# Runs on a push to main that changes index.html, or by hand (no inputs).
+
+name: Deploy yum.wheels.dev landing page
+
+on:
+  push:
+    branches: [main]
+    paths: [index.html]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: landing-yum
+  cancel-in-progress: false
+
+env:
+  R2_BUCKET: wheels-yum
+  CLOUDFLARE_ACCOUNT_ID: "511d04f367103ec276d875ab41a24dea"
+  SITE: https://yum.wheels.dev
+
+jobs:
+  deploy:
+    name: Upload index.html
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install wrangler
+        run: |
+          set -euo pipefail
+          sudo npm install -g wrangler@4.95.0
+          wrangler --version
+
+      - name: Upload index.html to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          # no-store, like the repo metadata: the page must never be served stale
+          # from the edge after a change.
+          for attempt in 1 2 3; do
+            if out="$(wrangler r2 object put "${R2_BUCKET}/index.html" \
+                --file=index.html --content-type="text/html; charset=utf-8" \
+                --cache-control="no-store, max-age=0" --remote 2>&1)"; then
+              echo "Uploaded index.html to ${R2_BUCKET}."
+              exit 0
+            fi
+            echo "::warning::r2 object put failed (attempt ${attempt}/3): ${out}" >&2
+            sleep $((attempt * 5))
+          done
+          echo "::error::r2 object put failed permanently for index.html" >&2
+          exit 1
+
+      - name: Purge the cached page
+        env:
+          # Optional, as in wheels-released.yml: purge needs a Zone.Cache-Purge
+          # token (CF_PURGE_TOKEN). Without one, the earlier copy may linger at the
+          # edge until its old TTL; new uploads are no-store.
+          CF_PURGE_TOKEN: ${{ secrets.CF_PURGE_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CF_PURGE_TOKEN:-}" ]; then
+            echo "No CF_PURGE_TOKEN configured; skipping purge."
+            exit 0
+          fi
+          ZONE_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/zones?name=wheels.dev" \
+            -H "Authorization: Bearer ${CF_PURGE_TOKEN}" | jq -r '.result[0].id // empty')"
+          if [ -z "$ZONE_ID" ]; then
+            echo "::warning::CF_PURGE_TOKEN is set but the wheels.dev zone could not be resolved."
+            exit 0
+          fi
+          payload="$(jq -n --arg u "${SITE}/index.html" '{files: [$u]}')"
+          resp="$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_PURGE_TOKEN}" -H "Content-Type: application/json" \
+            --data "$payload" || true)"
+          if [ "$(jq -r '.success // false' <<<"$resp")" = "true" ]; then
+            echo "Purged ${SITE}/index.html."
+          else
+            echo "::warning::purge did not report success: $(jq -rc '.errors // .' <<<"$resp" 2>/dev/null || echo "$resp")"
+          fi
