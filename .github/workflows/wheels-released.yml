@@ -59,7 +59,7 @@ env:
 jobs:
   publish:
     name: ${{ inputs.repair_only && 'Repair repodata' || 'Publish' }} ${{ github.event.client_payload.version || inputs.version }} (${{ github.event.client_payload.channel || inputs.channel }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Resolve inputs
